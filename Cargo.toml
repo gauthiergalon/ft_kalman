@@ -1,0 +1,8 @@
+[package]
+name = "ft_kalman"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+colored = "3.1.1"
