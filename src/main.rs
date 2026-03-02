@@ -1,33 +1,114 @@
+use nalgebra::{Matrix3, Matrix3x6, Matrix6, Matrix6x3, Rotation3, Vector3, Vector6};
 use std::io;
 use std::net::UdpSocket;
 use std::time::Duration;
 
-// ── Types ─────────────────────────────────────────────────────────────────────
+// ── Noise parameters ──────────────────────────────────────────────────────────
+const SIGMA_ACC: f64 = 1e-3;
+const SIGMA_GPS: f64 = 1e-1;
+const DT: f64 = 0.01;
 
-#[derive(Debug, Clone, Copy)]
-struct Vec3 {
-	x: f64,
-	y: f64,
-	z: f64,
-}
+// ── Types ─────────────────────────────────────────────────────────────────────
 
 #[derive(Debug)]
 enum Packet {
 	Start,
 	End,
-	Position(Vec3),
+	Position(Vector3<f64>),
 	Speed(f64),
-	Acceleration(Vec3),
-	Direction(Vec3),
+	Acceleration(Vector3<f64>),
+	Direction(Vector3<f64>),
 	Ignore,
 }
 
-#[derive(Debug)]
-struct State {
-	position: Vec3,
-	speed_mps: f64,
-	direction: Vec3,
-	acceleration: Vec3,
+// ── Kalman Filter (6D state: [px, py, pz, vx, vy, vz]) ───────────────────────
+//
+//  Predict:  x = F·x + B·a_world,  P = F·P·Fᵀ + Q
+//  Update:   y = gps - H·x,  S = H·P·Hᵀ + R,  K = P·Hᵀ·S⁻¹
+//            x = x + K·y,  P = (I-KH)·P·(I-KH)ᵀ + K·R·Kᵀ  (Joseph form)
+
+struct Kalman {
+	x: Vector6<f64>,
+	p: Matrix6<f64>,
+}
+
+impl Kalman {
+	fn new(pos: Vector3<f64>, vel_mps: f64, dir: Vector3<f64>) -> Self {
+		let h = euler_forward(dir);
+		let x = Vector6::new(
+			pos.x,
+			pos.y,
+			pos.z,
+			h.x * vel_mps,
+			h.y * vel_mps,
+			h.z * vel_mps,
+		);
+		Kalman {
+			x,
+			p: Matrix6::identity(),
+		}
+	}
+
+	/// Predict step — called every dt = 10 ms with world-frame acceleration
+	fn predict(&mut self, a: Vector3<f64>, dt: f64) {
+		// Transition matrix F = [[I3, dt·I3], [0, I3]]
+		let mut f = Matrix6::identity();
+		f[(0, 3)] = dt;
+		f[(1, 4)] = dt;
+		f[(2, 5)] = dt;
+
+		// Control input B·u = [½·a·dt², a·dt]
+		let bu = Vector6::new(
+			0.5 * a.x * dt * dt,
+			0.5 * a.y * dt * dt,
+			0.5 * a.z * dt * dt,
+			a.x * dt,
+			a.y * dt,
+			a.z * dt,
+		);
+
+		// Process noise Q = σ² · [[dt⁴/4·I3, dt³/2·I3], [dt³/2·I3, dt²·I3]]
+		let s2 = SIGMA_ACC * SIGMA_ACC;
+		let (dt2, dt3, dt4) = (dt * dt, dt.powi(3), dt.powi(4));
+		let mut q = Matrix6::zeros();
+		for i in 0..3 {
+			q[(i, i)] = s2 * dt4 / 4.0;
+			q[(i, i + 3)] = s2 * dt3 / 2.0;
+			q[(i + 3, i)] = s2 * dt3 / 2.0;
+			q[(i + 3, i + 3)] = s2 * dt2;
+		}
+
+		self.x = f * self.x + bu;
+		self.p = f * self.p * f.transpose() + q;
+	}
+
+	/// Update step — called when GPS measurement arrives
+	fn update(&mut self, gps: Vector3<f64>) {
+		// H = [I3 | 0]  (3×6)
+		let h = Matrix3x6::<f64>::new(
+			1., 0., 0., 0., 0., 0., 0., 1., 0., 0., 0., 0., 0., 0., 1., 0., 0., 0.,
+		);
+
+		let r: Matrix3<f64> = Matrix3::identity() * (SIGMA_GPS * SIGMA_GPS);
+
+		let y = gps - h * self.x;
+		let s = h * self.p * h.transpose() + r;
+
+		if let Some(s_inv) = s.try_inverse() {
+			let k: Matrix6x3<f64> = self.p * h.transpose() * s_inv;
+			self.x += k * y;
+
+			// Joseph form: (I-KH)·P·(I-KH)ᵀ + K·R·Kᵀ
+			// Numerically stable — keeps P symmetric and positive semi-definite
+			// even after thousands of iterations, unlike the naive (I-KH)·P form.
+			let i_kh = Matrix6::identity() - k * h;
+			self.p = i_kh * self.p * i_kh.transpose() + k * r * k.transpose();
+		}
+	}
+
+	fn position(&self) -> Vector3<f64> {
+		Vector3::new(self.x[0], self.x[1], self.x[2])
+	}
 }
 
 // ── Main loop ─────────────────────────────────────────────────────────────────
@@ -44,13 +125,14 @@ fn main() -> io::Result<()> {
 	}
 	socket.send_to(b"READY", dest)?;
 
-	let mut buf = [0u8; 4096];
-	let mut state: Option<State> = None;
+	let mut buf = [0u8; 1024];
+	let mut kalman: Option<Kalman> = None;
+	let mut last_direction = Vector3::zeros();
 
 	loop {
 		// 1. Wait for MSG_START
 		loop {
-			match recv(&socket, &mut buf, debug)? {
+			match recv(&socket, &mut buf[..], debug)? {
 				Packet::Start => break,
 				_ => continue,
 			}
@@ -59,93 +141,85 @@ fn main() -> io::Result<()> {
 		// 2. Collect packets until MSG_END
 		let mut block: Vec<Packet> = Vec::new();
 		loop {
-			match recv(&socket, &mut buf, debug)? {
+			match recv(&socket, &mut buf[..], debug)? {
 				Packet::End => break,
 				pkt => block.push(pkt),
 			}
 		}
 
-		// 3. Update state (Kalman filter goes here)
-		state = update(state, block);
+		// 3. Update Kalman filter
+		match kalman {
+			// ── First block: initialise filter ──────────────────────────────
+			None => {
+				let mut pos: Option<Vector3<f64>> = None;
+				let mut spd: Option<f64> = None;
+				let mut dir: Option<Vector3<f64>> = None;
+
+				for pkt in block {
+					match pkt {
+						Packet::Position(p) => pos = Some(p),
+						Packet::Speed(v) => spd = Some(v),
+						Packet::Direction(d) => dir = Some(d),
+						_ => {}
+					}
+				}
+
+				if let (Some(p), Some(s), Some(d)) = (pos, spd, dir) {
+					last_direction = d;
+					kalman = Some(Kalman::new(p, s / 3.6, d));
+				}
+			}
+
+			// ── Subsequent blocks: predict + optional GPS update ─────────────
+			Some(ref mut kf) => {
+				let mut gps: Option<Vector3<f64>> = None;
+				let mut acc: Option<Vector3<f64>> = None;
+
+				for pkt in block {
+					match pkt {
+						Packet::Acceleration(a) => acc = Some(a),
+						Packet::Direction(d) => last_direction = d,
+						Packet::Position(p) => gps = Some(p),
+						_ => {}
+					}
+				}
+
+				if let Some(a_body) = acc {
+					let a_world = rotate_euler_to_world(last_direction, a_body);
+					kf.predict(a_world, DT);
+				}
+
+				if let Some(gps_pos) = gps {
+					kf.update(gps_pos);
+				}
+			}
+		}
 
 		// 4. Send estimated position
-		if let Some(ref s) = state {
-			let msg = format!("{} {} {}", s.position.x, s.position.y, s.position.z);
+		if let Some(ref kf) = kalman {
+			let pos = kf.position();
+			let msg = format!("{} {} {}", pos.x, pos.y, pos.z);
 			if debug {
 				println!(">> {}", msg);
 			}
 			socket.send_to(msg.as_bytes(), dest)?;
-			println!(
-				"pos: {:.3} {:.3} {:.3}",
-				s.position.x, s.position.y, s.position.z
-			);
+			println!("pos: {:.3} {:.3} {:.3}", pos.x, pos.y, pos.z);
 		}
 	}
 }
 
-// ── State update ──────────────────────────────────────────────────────────────
+// ── Geometry ──────────────────────────────────────────────────────────────────
 
-const DT: f64 = 0.01; // 10 ms per step
+/// Forward unit vector from Euler angles (roll, pitch, yaw) in radians
+fn euler_forward(e: Vector3<f64>) -> Vector3<f64> {
+	Vector3::new(e.y.cos() * e.z.cos(), e.y.cos() * e.z.sin(), e.y.sin())
+}
 
-fn update(prev: Option<State>, block: Vec<Packet>) -> Option<State> {
-	match prev {
-		// First block: bootstrap from all available data
-		None => {
-			let mut pos = None;
-			let mut spd = None;
-			let mut acc = None;
-			let mut dir = None;
-
-			for pkt in block {
-				match pkt {
-					Packet::Position(p) => pos = Some(p),
-					Packet::Speed(v) => spd = Some(v),
-					Packet::Acceleration(a) => acc = Some(a),
-					Packet::Direction(d) => dir = Some(d),
-					_ => {}
-				}
-			}
-
-			Some(State {
-				position: pos?,
-				speed_mps: spd? / 3.6, // convert km/h -> m/s
-				acceleration: acc?,
-				direction: dir?,
-			})
-		}
-
-		// Subsequent blocks: integrate motion + optional GPS correction
-		Some(mut s) => {
-			for pkt in block {
-				match pkt {
-					Packet::Acceleration(a) => s.acceleration = a,
-					Packet::Direction(d) => s.direction = d,
-					// GPS arrives every ~3 s — TODO: replace with Kalman correction
-					Packet::Position(p) => s.position = p,
-					_ => {}
-				}
-			}
-
-			// TODO: Kalman predict step
-			// Interpret `direction` as Euler angles (roll, pitch, yaw).
-			// Compute forward heading, rotate body-frame acceleration to world-frame,
-			// then integrate speed (m/s) and position.
-			let heading = euler_forward(s.direction);
-			let acc_world = rotate_euler_to_world(s.direction, s.acceleration);
-			let acc_along = dot(&acc_world, &heading);
-
-			let v = s.speed_mps; // m/s
-			let v_new = v + acc_along * DT;
-
-			s.position.x += heading.x * v * DT + 0.5 * heading.x * acc_along * DT * DT;
-			s.position.y += heading.y * v * DT + 0.5 * heading.y * acc_along * DT * DT;
-			s.position.z += heading.z * v * DT + 0.5 * heading.z * acc_along * DT * DT;
-
-			s.speed_mps = v_new;
-
-			Some(s)
-		}
-	}
+/// Rotate a vector from body frame to world frame using Z(yaw)·Y(pitch)·X(roll)
+fn rotate_euler_to_world(e: Vector3<f64>, v: Vector3<f64>) -> Vector3<f64> {
+	// Rotation3::from_euler_angles(roll, pitch, yaw) builds Rz·Ry·Rx,
+	// which is the standard aerospace body→world rotation.
+	Rotation3::from_euler_angles(e.x, e.y, e.z) * v
 }
 
 // ── Parsing ───────────────────────────────────────────────────────────────────
@@ -154,13 +228,15 @@ fn recv(socket: &UdpSocket, buf: &mut [u8], debug: bool) -> io::Result<Packet> {
 	let (size, _) = socket.recv_from(buf)?;
 	let raw = String::from_utf8_lossy(&buf[..size]);
 	if debug {
-		let display = raw.trim().replace('\n', "\\n");
-		println!("<< {}", display);
+		println!("<< {}", raw.trim().replace('\n', "\\n"));
 	}
 	Ok(parse(raw.trim()))
 }
 
 fn parse(raw: &str) -> Packet {
+	if raw == "GOODBYE." {
+		std::process::exit(0);
+	}
 	if raw == "MSG_START" {
 		return Packet::Start;
 	}
@@ -183,7 +259,7 @@ fn parse(raw: &str) -> Packet {
 		.collect();
 
 	match key.trim() {
-		"TRUE POSITION" => vec3(&vals).map(Packet::Position).unwrap_or(Packet::Ignore),
+		"TRUE POSITION" | "POSITION" => vec3(&vals).map(Packet::Position).unwrap_or(Packet::Ignore),
 		"ACCELERATION" => vec3(&vals)
 			.map(Packet::Acceleration)
 			.unwrap_or(Packet::Ignore),
@@ -197,45 +273,9 @@ fn parse(raw: &str) -> Packet {
 	}
 }
 
-fn vec3(v: &[f64]) -> Option<Vec3> {
+fn vec3(v: &[f64]) -> Option<Vector3<f64>> {
 	if v.len() < 3 {
 		return None;
 	}
-	Some(Vec3 {
-		x: v[0],
-		y: v[1],
-		z: v[2],
-	})
-}
-
-fn dot(a: &Vec3, b: &Vec3) -> f64 {
-	a.x * b.x + a.y * b.y + a.z * b.z
-}
-
-// Forward vector from Euler angles (roll, pitch, yaw)
-fn euler_forward(e: Vec3) -> Vec3 {
-	let pitch = e.y;
-	let yaw = e.z;
-	let cp = pitch.cos();
-	let sp = pitch.sin();
-	let cy = yaw.cos();
-	let sy = yaw.sin();
-	Vec3 {
-		x: cp * cy,
-		y: cp * sy,
-		z: sp,
-	}
-}
-
-// Rotate a vector from body frame to world frame using Z(yaw)*Y(pitch)*X(roll)
-fn rotate_euler_to_world(e: Vec3, v: Vec3) -> Vec3 {
-	let (roll, pitch, yaw) = (e.x, e.y, e.z);
-	let (cr, sr) = (roll.cos(), roll.sin());
-	let (cp, sp) = (pitch.cos(), pitch.sin());
-	let (cy, sy) = (yaw.cos(), yaw.sin());
-
-	let x = (cy * cp) * v.x + (cy * sp * sr - sy * cr) * v.y + (cy * sp * cr + sy * sr) * v.z;
-	let y = (sy * cp) * v.x + (sy * sp * sr + cy * cr) * v.y + (sy * sp * cr - cy * sr) * v.z;
-	let z = (-sp) * v.x + (cp * sr) * v.y + (cp * cr) * v.z;
-	Vec3 { x, y, z }
+	Some(Vector3::new(v[0], v[1], v[2]))
 }
