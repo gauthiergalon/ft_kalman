@@ -4,6 +4,7 @@ use std::net::UdpSocket;
 use std::time::Duration;
 
 const SIGMA_ACC: f64 = 1e-3;
+const SIGMA_GYRO: f64 = 1e-2;
 const SIGMA_GPS: f64 = 1e-1;
 const DT: f64 = 0.01;
 
@@ -34,10 +35,15 @@ impl Kalman {
 			h.y * vel_mps,
 			h.z * vel_mps,
 		);
-		Kalman {
-			x,
-			p: Matrix6::identity(),
-		}
+
+		let vel_var = (vel_mps * SIGMA_GYRO).powi(2);
+
+		let mut p = Matrix6::zeros();
+		p[(3, 3)] = vel_var;
+		p[(4, 4)] = vel_var;
+		p[(5, 5)] = vel_var;
+
+		Kalman { x, p }
 	}
 
 	fn predict(&mut self, a: Vector3<f64>, dt: f64) {
