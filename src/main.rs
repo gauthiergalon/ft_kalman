@@ -1,5 +1,6 @@
 use nalgebra::{Matrix3, Matrix3x6, Matrix6, Matrix6x3, Vector3, Vector6};
-use std::io;
+use std::fs::OpenOptions;
+use std::io::{self, Write};
 use std::net::UdpSocket;
 use std::time::Duration;
 
@@ -36,7 +37,7 @@ impl Kalman {
 			h.z * vel_mps,
 		);
 
-		let vel_var = (vel_mps * SIGMA_GYRO).powi(2);
+		let vel_var = SIGMA_GYRO.powi(2) + SIGMA_ACC.powi(2) * DT;
 
 		let mut p = Matrix6::zeros();
 		p[(3, 3)] = vel_var;
@@ -103,9 +104,10 @@ impl Kalman {
 
 fn main() -> io::Result<()> {
 	let debug = std::env::args().any(|a| a == "--debug");
+	let output = std::env::args().any(|a| a == "--output");
 
 	let socket = UdpSocket::bind("127.0.0.1:0")?;
-	socket.set_read_timeout(Some(Duration::from_secs(5)))?;
+	socket.set_read_timeout(Some(Duration::from_secs(1)))?;
 
 	let dest = "127.0.0.1:4242";
 	if debug {
@@ -115,6 +117,17 @@ fn main() -> io::Result<()> {
 
 	let mut buf = [0u8; 1024];
 	let mut kalman: Option<Kalman> = None;
+
+	let mut writer: Box<dyn Write> = if output {
+		let f = OpenOptions::new()
+			.create(true)
+			.write(true)
+			.truncate(true)
+			.open("positions.csv")?;
+		Box::new(f)
+	} else {
+		Box::new(io::stdout())
+	};
 
 	loop {
 		loop {
@@ -181,13 +194,13 @@ fn main() -> io::Result<()> {
 				println!(">> {}", msg);
 			}
 			socket.send_to(msg.as_bytes(), dest)?;
-			println!("pos: {:.3} {:.3} {:.3}", pos.x, pos.y, pos.z);
+			writeln!(writer, "{:.6},{:.6},{:.6}", pos.x, pos.y, pos.z)?;
 		}
 	}
 }
 
 fn euler_forward(e: Vector3<f64>) -> Vector3<f64> {
-	Vector3::new(e.y.cos() * e.z.cos(), e.y.cos() * e.z.sin(), e.y.sin())
+	Vector3::new(e.y.cos() * e.z.cos(), e.y.cos() * e.z.sin(), -e.y.sin())
 }
 
 fn recv(socket: &UdpSocket, buf: &mut [u8], debug: bool) -> io::Result<Packet> {
