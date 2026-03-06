@@ -1,137 +1,40 @@
-use nalgebra::{Matrix3, Matrix3x6, Matrix6, Matrix6x3, Vector3, Vector6};
-use std::fs::OpenOptions;
-use std::io::{self, Write};
-use std::net::UdpSocket;
-use std::time::Duration;
+mod kalman;
+mod parsing;
+mod socket;
+mod utils;
 
-const SIGMA_ACC: f64 = 1e-3;
-const SIGMA_GYRO: f64 = 1e-2;
-const SIGMA_GPS: f64 = 1e-1;
-const DT: f64 = 0.01;
+use kalman::Kalman;
+use nalgebra::Vector3;
+use parsing::Packet;
+use socket::{create_socket, recv};
+use utils::{log_position, set_output};
 
-#[derive(Debug)]
-enum Packet {
-	Start,
-	End,
-	Position(Vector3<f64>),
-	Speed(f64),
-	Acceleration(Vector3<f64>),
-	Direction(Vector3<f64>),
-	Ignore,
-}
+use std::io::{self};
 
-struct Kalman {
-	x: Vector6<f64>,
-	p: Matrix6<f64>,
-}
+use crate::parsing::parse;
 
-impl Kalman {
-	fn new(pos: Vector3<f64>, vel_mps: f64, dir: Vector3<f64>) -> Self {
-		let h = euler_forward(dir);
-		let x = Vector6::new(
-			pos.x,
-			pos.y,
-			pos.z,
-			h.x * vel_mps,
-			h.y * vel_mps,
-			h.z * vel_mps,
-		);
+pub const SIGMA_ACC: f64 = 1e-3;
+pub const SIGMA_GYRO: f64 = 1e-2;
+pub const SIGMA_GPS: f64 = 1e-1;
+pub const DT: f64 = 0.01;
 
-		let vel_var = SIGMA_GYRO.powi(2) + SIGMA_ACC.powi(2) * DT;
-
-		let mut p = Matrix6::zeros();
-		p[(3, 3)] = vel_var;
-		p[(4, 4)] = vel_var;
-		p[(5, 5)] = vel_var;
-
-		Kalman { x, p }
-	}
-
-	fn predict(&mut self, a: Vector3<f64>, dt: f64) {
-		let mut f = Matrix6::identity();
-		f[(0, 3)] = dt;
-		f[(1, 4)] = dt;
-		f[(2, 5)] = dt;
-
-		let bu = Vector6::new(
-			0.5 * a.x * dt * dt,
-			0.5 * a.y * dt * dt,
-			0.5 * a.z * dt * dt,
-			a.x * dt,
-			a.y * dt,
-			a.z * dt,
-		);
-
-		let s2 = SIGMA_ACC * SIGMA_ACC;
-		let (dt2, dt3, dt4) = (dt * dt, dt.powi(3), dt.powi(4));
-		let mut q = Matrix6::zeros();
-		for i in 0..3 {
-			q[(i, i)] = s2 * dt4 / 4.0;
-			q[(i, i + 3)] = s2 * dt3 / 2.0;
-			q[(i + 3, i)] = s2 * dt3 / 2.0;
-			q[(i + 3, i + 3)] = s2 * dt2;
-		}
-
-		self.x = f * self.x + bu;
-		self.p = f * self.p * f.transpose() + q;
-	}
-
-	fn update(&mut self, gps: Vector3<f64>) {
-		let h = Matrix3x6::<f64>::new(
-			1., 0., 0., 0., 0., 0., 0., 1., 0., 0., 0., 0., 0., 0., 1., 0., 0., 0.,
-		);
-
-		let r: Matrix3<f64> = Matrix3::identity() * (SIGMA_GPS * SIGMA_GPS);
-
-		let y = gps - h * self.x;
-
-		let s = h * self.p * h.transpose() + r;
-
-		if let Some(s_inv) = s.try_inverse() {
-			let k: Matrix6x3<f64> = self.p * h.transpose() * s_inv;
-
-			self.x += k * y;
-
-			let i_kh = Matrix6::identity() - k * h;
-			self.p = i_kh * self.p * i_kh.transpose() + k * r * k.transpose();
-		}
-	}
-
-	fn position(&self) -> Vector3<f64> {
-		Vector3::new(self.x[0], self.x[1], self.x[2])
-	}
-}
+pub const DEST: &str = "127.0.0.1:4242";
 
 fn main() -> io::Result<()> {
 	let debug = std::env::args().any(|a| a == "--debug");
 	let output = std::env::args().any(|a| a == "--output");
 
-	let socket = UdpSocket::bind("127.0.0.1:0")?;
-	socket.set_read_timeout(Some(Duration::from_secs(1)))?;
+	let socket = create_socket(debug)?;
 
-	let dest = "127.0.0.1:4242";
-	if debug {
-		println!(">> READY");
-	}
-	socket.send_to(b"READY", dest)?;
-
-	let mut buf = [0u8; 1024];
+	let mut buf: [u8; 1024] = [0u8; 1024];
 	let mut kalman: Option<Kalman> = None;
 
-	let mut writer: Box<dyn Write> = if output {
-		let f = OpenOptions::new()
-			.create(true)
-			.write(true)
-			.truncate(true)
-			.open("positions.csv")?;
-		Box::new(f)
-	} else {
-		Box::new(io::stdout())
-	};
+	let mut writer = set_output(output)?;
 
 	loop {
 		loop {
-			match recv(&socket, &mut buf[..], debug)? {
+			let msg = recv(&socket, &mut buf[..], debug)?;
+			match parse(msg) {
 				Packet::Start => break,
 				_ => continue,
 			}
@@ -139,7 +42,8 @@ fn main() -> io::Result<()> {
 
 		let mut block: Vec<Packet> = Vec::new();
 		loop {
-			match recv(&socket, &mut buf[..], debug)? {
+			let msg = recv(&socket, &mut buf[..], debug)?;
+			match parse(msg) {
 				Packet::End => break,
 				pkt => block.push(pkt),
 			}
@@ -189,72 +93,7 @@ fn main() -> io::Result<()> {
 
 		if let Some(ref kf) = kalman {
 			let pos = kf.position();
-			let msg = format!("{} {} {}", pos.x, pos.y, pos.z);
-			if debug {
-				println!(">> {}", msg);
-			}
-			socket.send_to(msg.as_bytes(), dest)?;
-			writeln!(writer, "{:.6},{:.6},{:.6}", pos.x, pos.y, pos.z)?;
+			log_position(pos, debug, &socket, &mut writer)?;
 		}
 	}
-}
-
-fn euler_forward(e: Vector3<f64>) -> Vector3<f64> {
-	Vector3::new(e.y.cos() * e.z.cos(), e.y.cos() * e.z.sin(), -e.y.sin())
-}
-
-fn recv(socket: &UdpSocket, buf: &mut [u8], debug: bool) -> io::Result<Packet> {
-	let (size, _) = socket.recv_from(buf)?;
-	let raw = String::from_utf8_lossy(&buf[..size]);
-	if debug {
-		println!("<< {}", raw.trim().replace('\n', "\\n"));
-	}
-	Ok(parse(raw.trim()))
-}
-
-fn parse(raw: &str) -> Packet {
-	if raw == "GOODBYE." {
-		std::process::exit(0);
-	}
-	if raw == "MSG_START" {
-		return Packet::Start;
-	}
-	if raw == "MSG_END" {
-		return Packet::End;
-	}
-
-	let (header, values) = match raw.split_once('\n') {
-		Some(pair) => pair,
-		None => return Packet::Ignore,
-	};
-	let (_, key) = match header.split_once(']') {
-		Some(pair) => pair,
-		None => return Packet::Ignore,
-	};
-
-	let vals: Vec<f64> = values
-		.lines()
-		.filter_map(|l| l.trim().parse().ok())
-		.collect();
-
-	match key.trim() {
-		"TRUE POSITION" | "POSITION" => vec3(&vals).map(Packet::Position).unwrap_or(Packet::Ignore),
-		"ACCELERATION" => vec3(&vals)
-			.map(Packet::Acceleration)
-			.unwrap_or(Packet::Ignore),
-		"DIRECTION" => vec3(&vals).map(Packet::Direction).unwrap_or(Packet::Ignore),
-		"SPEED" => vals
-			.first()
-			.copied()
-			.map(Packet::Speed)
-			.unwrap_or(Packet::Ignore),
-		_ => Packet::Ignore,
-	}
-}
-
-fn vec3(v: &[f64]) -> Option<Vector3<f64>> {
-	if v.len() < 3 {
-		return None;
-	}
-	Some(Vector3::new(v[0], v[1], v[2]))
 }
