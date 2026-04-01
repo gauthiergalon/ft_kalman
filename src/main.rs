@@ -82,7 +82,7 @@ fn main() -> io::Result<()> {
 				}
 
 				if let Some(a) = acc {
-					kf.predict(a, DT);
+					kf.predict(a);
 				}
 
 				if let Some(gps_pos) = gps {

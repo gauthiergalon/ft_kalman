@@ -9,6 +9,9 @@ use nalgebra::{Matrix3, Matrix3x6, Matrix6, Matrix6x3, Vector3, Vector6};
 pub struct Kalman {
 	x: Vector6<f64>,
 	p: Matrix6<f64>,
+	f: Matrix6<f64>,
+	f_t: Matrix6<f64>,
+	q: Matrix6<f64>,
 }
 
 //   x      (6×1) — state vector          [px, py, pz, vx, vy, vz]^T
@@ -53,40 +56,15 @@ impl Kalman {
 		p[(4, 4)] = vel_var;
 		p[(5, 5)] = vel_var;
 
-		Kalman { x, p }
-	}
-
-	pub fn predict(&mut self, a: Vector3<f64>, dt: f64) {
-		// State transition matrix F for a constant-acceleration model:
-		//   p_new = p + v*dt   =>  off-diagonal block = dt * I_3
-		//   v_new = v           =>  identity block
-		// F = | I  dt*I |
-		//     | 0    I  |
 		let mut f = Matrix6::identity();
-		f[(0, 3)] = dt;
-		f[(1, 4)] = dt;
-		f[(2, 5)] = dt;
+		f[(0, 3)] = DT;
+		f[(1, 4)] = DT;
+		f[(2, 5)] = DT;
+		
+		let f_t = f.transpose();
 
-		// Control input: integrate IMU acceleration over dt.
-		// Δp = 0.5 * a * dt²,  Δv = a * dt
-		// bu = B*u where u = a (measured acceleration vector)
-		let bu = Vector6::new(
-			0.5 * a.x * dt * dt,
-			0.5 * a.y * dt * dt,
-			0.5 * a.z * dt * dt,
-			a.x * dt,
-			a.y * dt,
-			a.z * dt,
-		);
-
-		// IMU acceleration noise: spectral density σ²
-		// integrated once  → velocity impact : σ²·dt
-		// integrated twice → position impact : σ²·dt²/2
-		// Q_vv = σ²·dt²     (σ²·dt × σ²·dt)
-		// Q_pp = σ²·dt⁴/4   (σ²·dt²/2 × σ²·dt²/2)
-		// Q_pv = σ²·dt³/2   (σ²·dt²/2 × σ²·dt)
 		let s2 = SIGMA_ACC * SIGMA_ACC;
-		let (dt2, dt3, dt4) = (dt * dt, dt.powi(3), dt.powi(4));
+		let (dt2, dt3, dt4) = (DT * DT, DT.powi(3), DT.powi(4));
 		let mut q = Matrix6::zeros();
 		for i in 0..3 {
 			q[(i, i)] = s2 * dt4 / 4.0;
@@ -95,10 +73,26 @@ impl Kalman {
 			q[(i + 3, i + 3)] = s2 * dt2;
 		}
 
+		Kalman { x, p, f, f_t, q }
+	}
+
+	pub fn predict(&mut self, a: Vector3<f64>) {
+		// Control input: integrate IMU acceleration over DT.
+		// Δp = 0.5 * a * DT²,  Δv = a * DT
+		// bu = B*u where u = a (measured acceleration vector)
+		let bu = Vector6::new(
+			0.5 * a.x * DT * DT,
+			0.5 * a.y * DT * DT,
+			0.5 * a.z * DT * DT,
+			a.x * DT,
+			a.y * DT,
+			a.z * DT,
+		);
+
 		// Predicted state:      x̂⁻ = F * x̂ + B*u
-		self.x = f * self.x + bu;
+		self.x = self.f * self.x + bu;
 		// Predicted covariance: P⁻ = F * P * Fᵀ + Q
-		self.p = f * self.p * f.transpose() + q;
+		self.p = self.f * self.p * self.f_t + self.q;
 	}
 
 	pub fn update(&mut self, gps: Vector3<f64>) {
