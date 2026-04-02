@@ -34,6 +34,19 @@ fn main() -> io::Result<()> {
 	let debug = std::env::args().any(|a| a == "--debug");
 	let output = std::env::args().any(|a| a == "--output");
 
+	let mut noise_scale = 1.0;
+	let args: Vec<String> = std::env::args().collect();
+	if let Some(idx) = args.iter().position(|a| a == "--noise") {
+		if let Some(val) = args.get(idx + 1) {
+			if let Ok(n) = val.parse::<f64>() && n >= 0.0 {
+				noise_scale = n;
+			} else {
+				eprintln!("Error: Invalid noise factor.");
+				std::process::exit(1);
+			}
+		}
+	}
+
 	let socket = create_socket(debug)?;
 
 	let mut buf: [u8; 1024] = [0u8; 1024];
@@ -75,7 +88,7 @@ fn main() -> io::Result<()> {
 				}
 
 				if let (Some(p), Some(s), Some(d)) = (pos, spd, dir) {
-					kalman = Some(Kalman::new(p, s / 3.6, d));
+					kalman = Some(Kalman::new(p, s / 3.6, d, noise_scale));
 				}
 			}
 

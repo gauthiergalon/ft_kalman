@@ -31,6 +31,8 @@ pub struct Kalman {
 	f_t: Matrix6<f64>,
 	/// `(6×6)` — process noise covariance
 	q: Matrix6<f64>,
+	/// Scaled GPS position noise
+	sigma_gps: f64,
 }
 
 impl Kalman {
@@ -38,7 +40,7 @@ impl Kalman {
 	///
 	/// Uses the given initial position `pos`, velocity scalar `vel_mps` (in `m/s`),
 	/// and Euler angles `dir` to build the initial state vector.
-	pub fn new(pos: Vector3<f64>, vel_mps: f64, dir: Vector3<f64>) -> Self {
+	pub fn new(pos: Vector3<f64>, vel_mps: f64, dir: Vector3<f64>, noise_scale: f64) -> Self {
 		// Convert heading direction to a unit vector using Euler angles,
 		// then decompose the initial speed into its x/y/z components.
 		// Initial state vector: x = [px, py, pz, vx, vy, vz]^T
@@ -56,7 +58,10 @@ impl Kalman {
 		// Position variance is assumed negligible (GPS fix), velocity
 		// variance is estimated from gyro and accelerometer noise:
 		//   var(v) = sigma_gyro^2 + sigma_acc^2 * dt
-		let vel_var = SIGMA_GYRO.powi(2) + SIGMA_ACC.powi(2) * DT;
+		let scaled_sigma_acc = SIGMA_ACC * noise_scale;
+		let scaled_sigma_gps = SIGMA_GPS * noise_scale;
+
+		let vel_var = SIGMA_GYRO.powi(2) + scaled_sigma_acc.powi(2) * DT;
 
 		let mut p = Matrix6::zeros();
 		p[(3, 3)] = vel_var;
@@ -80,7 +85,7 @@ impl Kalman {
 			q[(i + 3, i + 3)] = s2 * dt2;
 		}
 
-		Kalman { x, p, f, f_t, q }
+		Kalman { x, p, f, f_t, q, sigma_gps: scaled_sigma_gps }
 	}
 
 	/// Predicts the next state given a measured acceleration `a` from the IMU.
@@ -118,7 +123,7 @@ impl Kalman {
 		);
 
 		// Measurement noise covariance R = sigma_gps^2 * I_3
-		let r: Matrix3<f64> = Matrix3::identity() * (SIGMA_GPS * SIGMA_GPS);
+		let r: Matrix3<f64> = Matrix3::identity() * (self.sigma_gps * self.sigma_gps);
 
 		// Innovation (measurement residual): y = z - H * x̂⁻
 		let y = gps - h * self.x;
