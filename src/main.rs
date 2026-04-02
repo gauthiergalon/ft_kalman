@@ -1,7 +1,12 @@
-mod kalman;
-mod parsing;
-mod socket;
-mod utils;
+//! Main application entry point for the Kalman filter module.
+//!
+//! Receives IMU and GPS UDP data packets, parses them, runs them through the Kalman filter,
+//! and logs/sends back the resulting estimated position.
+
+pub mod kalman;
+pub mod parsing;
+pub mod socket;
+pub mod utils;
 
 use kalman::Kalman;
 use nalgebra::Vector3;
@@ -13,11 +18,16 @@ use std::io::{self};
 
 use crate::parsing::parse;
 
+/// Accelerometer sensor noise standard deviation (`m/s²`)
 pub const SIGMA_ACC: f64 = 1e-3;
+/// Gyroscope sensor noise standard deviation (`rad/s`)
 pub const SIGMA_GYRO: f64 = 1e-2;
+/// GPS position measurement noise standard deviation (`m`)
 pub const SIGMA_GPS: f64 = 1e-1;
+/// Fixed time step delta (`s`)
 pub const DT: f64 = 0.01;
 
+/// Destination UDP socket address for processed data
 pub const DEST: &str = "127.0.0.1:4242";
 
 fn main() -> io::Result<()> {
