@@ -1,7 +1,11 @@
-//! Kalman filter implementation for 3D state estimation.
+//! Kalman filter for 3D motion tracking.
 //!
-//! This module provides the `Kalman` struct, which merges IMU and GPS measurements
-//! to estimate the position and velocity of a moving object.
+//! This module estimates where an object is and how fast it moves by combining:
+//! - IMU acceleration (high-rate, noisy)
+//! - GPS position (slower, absolute reference)
+//!
+//! The filter state is 3D position + 3D velocity, and follows the usual
+//! predict/update Kalman cycle.
 
 use crate::DT;
 use crate::SIGMA_ACC;
@@ -11,15 +15,16 @@ use crate::utils::euler_forward;
 
 use nalgebra::{Matrix3, Matrix3x6, Matrix6, Matrix6x3, Vector3, Vector6};
 
-/// A standard Kalman Filter tracking 3D position and velocity.
+/// Kalman filter with a 6D state: position and velocity in 3 axes.
 ///
-/// State vector `x` is `(6×1)`: `[px, py, pz, vx, vy, vz]^T`
+/// State vector:
+/// `x = [px, py, pz, vx, vy, vz]^T` (size `6×1`)
 ///
-/// Constants:
-/// * `SIGMA_ACC`  — accelerometer noise std dev (`m/s²`)
-/// * `SIGMA_GYRO` — gyroscope noise std dev (`rad/s`)
-/// * `SIGMA_GPS`  — GPS position noise std dev (`m`)
-/// * `DT`         — nominal time step (`s`)
+/// Noise/step constants used by this implementation:
+/// - `SIGMA_ACC`: accelerometer noise std dev (`m/s²`)
+/// - `SIGMA_GYRO`: gyroscope noise std dev (`rad/s`)
+/// - `SIGMA_GPS`: GPS position noise std dev (`m`)
+/// - `DT`: nominal integration step (`s`)
 pub struct Kalman {
 	/// `(6×1)` — state vector `[px, py, pz, vx, vy, vz]^T`
 	x: Vector6<f64>,
@@ -36,14 +41,19 @@ pub struct Kalman {
 }
 
 impl Kalman {
-	/// Initializes a new Kalman filter.
+	/// Builds a Kalman filter from an initial pose and speed.
 	///
-	/// Uses the given initial position `pos`, velocity scalar `vel_mps` (in `m/s`),
-	/// and Euler angles `dir` to build the initial state vector.
+	/// Inputs:
+	/// - `pos`: initial position
+	/// - `vel_mps`: initial speed magnitude (`m/s`)
+	/// - `dir`: Euler angles used to derive the forward unit direction
+	/// - `noise_scale`: global multiplier applied to sensor noise terms
+	///
+	/// The initial velocity components are computed as:
+	/// `v0 = euler_forward(dir) * vel_mps`.
 	pub fn new(pos: Vector3<f64>, vel_mps: f64, dir: Vector3<f64>, noise_scale: f64) -> Self {
-		// Convert heading direction to a unit vector using Euler angles,
-		// then decompose the initial speed into its x/y/z components.
-		// Initial state vector: x = [px, py, pz, vx, vy, vz]^T
+		// Convert Euler orientation into a forward unit vector, then project
+		// the scalar speed onto x/y/z to initialize [vx, vy, vz].
 		let h = euler_forward(dir);
 		let x = Vector6::new(
 			pos.x,
@@ -54,9 +64,9 @@ impl Kalman {
 			h.z * vel_mps,
 		);
 
-		// Initial covariance matrix P:
-		// Position variance is assumed negligible (GPS fix), velocity
-		// variance is estimated from gyro and accelerometer noise:
+		// Initial covariance P:
+		// - Position starts with near-zero uncertainty (trusted initial fix).
+		// - Velocity uncertainty comes from motion sensors:
 		//   var(v) = sigma_gyro^2 + sigma_acc^2 * dt
 		let scaled_sigma_acc = SIGMA_ACC * noise_scale;
 		let scaled_sigma_gps = SIGMA_GPS * noise_scale;
@@ -75,6 +85,9 @@ impl Kalman {
 		
 		let f_t = f.transpose();
 
+		// Continuous white-noise acceleration model discretized over DT.
+		// This builds the standard constant-acceleration process covariance:
+		// position block ~ dt^4, cross block ~ dt^3, velocity block ~ dt^2.
 		let s2 = SIGMA_ACC * SIGMA_ACC;
 		let (dt2, dt3, dt4) = (DT * DT, DT.powi(3), DT.powi(4));
 		let mut q = Matrix6::zeros();
@@ -88,14 +101,17 @@ impl Kalman {
 		Kalman { x, p, f, f_t, q, sigma_gps: scaled_sigma_gps }
 	}
 
-	/// Predicts the next state given a measured acceleration `a` from the IMU.
+	/// Prediction step using IMU acceleration.
 	///
-	/// Control input: integrate IMU acceleration over `DT`.
-	/// `Δp = 0.5 * a * DT²`, `Δv = a * DT`
+	/// Over one timestep `DT`, acceleration contributes:
+	/// - `Δp = 0.5 * a * DT²`
+	/// - `Δv = a * DT`
+	///
+	/// Then the filter applies:
+	/// - state prediction: `x̂⁻ = F x̂ + B u`
+	/// - covariance prediction: `P⁻ = F P Fᵀ + Q`
 	pub fn predict(&mut self, a: Vector3<f64>) {
-		// Control input: integrate IMU acceleration over DT.
-		// Δp = 0.5 * a * DT²,  Δv = a * DT
-		// bu = B*u where u = a (measured acceleration vector)
+		// Build B*u explicitly from acceleration integration terms.
 		let bu = Vector6::new(
 			0.5 * a.x * DT * DT,
 			0.5 * a.y * DT * DT,
@@ -105,24 +121,27 @@ impl Kalman {
 			a.z * DT,
 		);
 
-		// Predicted state:      x̂⁻ = F * x̂ + B*u
+		// Predicted state x̂⁻.
 		self.x = self.f * self.x + bu;
-		// Predicted covariance: P⁻ = F * P * Fᵀ + Q
+		// Predicted covariance P⁻.
 		self.p = self.f * self.p * self.f_t + self.q;
 	}
 
-	/// Updates the state estimation with a new GPS position measurement `gps`.
+	/// Correction step using a GPS position sample.
 	///
-	/// Fuses the predicted position with the observed `gps` coordinates to produce
-	/// an optimal state estimate using the optimal Kalman gain.
+	/// Only position is observed by GPS, so this step:
+	/// - compares predicted position vs measurement (`y = z - Hx̂⁻`)
+	/// - computes Kalman gain (`K = P⁻HᵀS⁻¹`)
+	/// - updates both position and velocity in the state through coupling
+	/// - updates covariance with the Joseph form for better numerical stability
 	pub fn update(&mut self, gps: Vector3<f64>) {
-		// Observation matrix H: maps the full state [p, v] to the observed
-		// position only.  H = [ I_3 | 0_3 ]  (3×6)
+		// Observation matrix H keeps [px, py, pz] and ignores [vx, vy, vz]:
+		// H = [ I_3 | 0_3 ] (shape 3x6)
 		let h = Matrix3x6::<f64>::new(
 			1., 0., 0., 0., 0., 0., 0., 1., 0., 0., 0., 0., 0., 0., 1., 0., 0., 0.,
 		);
 
-		// Measurement noise covariance R = sigma_gps^2 * I_3
+		// Measurement noise covariance: R = sigma_gps^2 * I_3
 		let r: Matrix3<f64> = Matrix3::identity() * (self.sigma_gps * self.sigma_gps);
 
 		// Innovation (measurement residual): y = z - H * x̂⁻
@@ -145,7 +164,7 @@ impl Kalman {
 		}
 	}
 
-	/// Returns the current estimated position as a 3D vector.
+	/// Current estimated position `[px, py, pz]`.
 	pub fn position(&self) -> Vector3<f64> {
 		Vector3::new(self.x[0], self.x[1], self.x[2])
 	}
